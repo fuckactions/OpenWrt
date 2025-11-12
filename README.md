@@ -1,8 +1,8 @@
 # 编译状态
 
-[![Openwrt-Firmware-Build](https://github.com/somemoo/OpenWrt/actions/workflows/Openwrt-Firmware-Build.yml/badge.svg)](https://github.com/somemoo/OpenWrt/actions/workflows/Openwrt-Firmware-Build.yml)
-[![](https://img.shields.io/github/release-pre/somemoo/OpenWrt.svg)](https://github.com/somemoo/OpenWrt/releases)
-[![](https://img.shields.io/github/license/mashape/apistatus.svg)](https://github.com/somemoo/OpenWrt)
+[![Openwrt-Firmware-Build](https://github.com/fuckactions/OpenWrt/actions/workflows/Openwrt-Firmware-Build.yml/badge.svg)](https://github.com/fuckactions/OpenWrt/actions/workflows/Openwrt-Firmware-Build.yml)
+[![](https://img.shields.io/github/release-pre/fuckactions/OpenWrt.svg)](https://github.com/fuckactions/OpenWrt/releases)
+[![](https://img.shields.io/github/license/mashape/apistatus.svg)](https://github.com/fuckactions/OpenWrt)
 
 ## 编译注意
 
