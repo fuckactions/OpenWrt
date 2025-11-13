@@ -1,0 +1,397 @@
+#=================================================  
+# https://github.com/fuckactions/OpenWrt  
+# 描述: 使用 GitHub Actions 构建 OpenWrt  
+# 许可证: MIT  
+# 作者: vison.v   
+#=================================================  
+
+name: Openwrt-Firmware-Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      REPO:
+        description: '选择仓库'
+        default: 'lede'
+        type: choice
+        options: ['lede', 'immortalwrt', 'openwrt']
+      ARCH:
+        description: '输入架构 (例如: x86-64,ac58u)'
+        default: ''
+        type: string
+        
+  schedule:
+    - cron: "5 19 */3 * *"
+  watch:
+    types: started
+
+permissions: write-all
+
+env:
+  GITHUB_TOKEN: ${{secrets.REPO_TOKEN}}
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@main
+
+      - name: 构建矩阵
+        id: set-matrix
+        run: |
+          FIRMWARE_ARRAY=()
+          ARCH_INPUT="${{ github.event.inputs.ARCH }}"
+          REPO_SELECTED="${{ github.event.inputs.REPO }}"
+          DEFAULT_REPO="lede"
+          REPO_USED="${REPO_SELECTED:-$DEFAULT_REPO}"
+          HAS_ARCH_INPUT=false
+
+          if [[ -n "$ARCH_INPUT" ]]; then
+            HAS_ARCH_INPUT=true
+            IFS=',; ' read -ra input_parts <<< "$ARCH_INPUT"
+            for part in "${input_parts[@]}"; do
+              clean_part=$(echo "$part" | xargs)
+              [[ -z "$clean_part" ]] && continue              
+              if [[ "$clean_part" =~ ^(lede|immortalwrt|openwrt) ]]; then
+                new_target="$clean_part"
+              else
+                new_target="${REPO_USED}-${clean_part}"
+              fi
+              FIRMWARE_ARRAY+=("$new_target")
+            done
+          fi
+
+          if [[ "$HAS_ARCH_INPUT" == false ]] && [[ -f "Build-OpenWrt" && -s "Build-OpenWrt" ]]; then
+            while IFS= read -r line; do
+              [[ "$line" =~ ^[[:space:]]*# || -z "${line// }" ]] && continue
+              IFS=',; ' read -ra parts <<< "$line"
+              for part in "${parts[@]}"; do
+                clean_part=$(echo "$part" | xargs)
+                [[ -z "$clean_part" ]] && continue                
+                if [[ "$clean_part" =~ ^(lede|immortalwrt|openwrt) ]]; then
+                  new_target="$clean_part"
+                else
+                  new_target="${REPO_USED}-${clean_part}"
+                fi
+                FIRMWARE_ARRAY+=("$new_target")
+              done
+            done < Build-OpenWrt
+          fi
+
+          if [[ ${#FIRMWARE_ARRAY[@]} -eq 0 ]]; then
+            echo "::error::错误：未找到有效的构建目标"
+            exit 1
+          fi
+
+          FIRMWARE_ARRAY=($(printf "%s\n" "${FIRMWARE_ARRAY[@]}" | sort -u))
+          targets_json=$(jq -c -n --argjson arr "$(printf '%s\n' "${FIRMWARE_ARRAY[@]}" | jq -R . | jq -s .)" '$arr')
+          echo "matrix=$targets_json" >> $GITHUB_OUTPUT
+
+  build:
+    name: 构建 ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    needs: matrix
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.matrix.outputs.matrix) }}
+      fail-fast: false
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@main
+        with:
+          fetch-depth: 0
+
+      - name: 配置变量
+        run: |
+          echo "REPO_NAME=$(basename "${{ matrix.target }}" | awk -F'-' '{print $1}')" >> $GITHUB_ENV
+          echo "ARCH_NAME=$(basename "${{ matrix.target }}" | sed -E 's/^[^-]*-//')" >> $GITHUB_ENV
+          echo "date=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
+
+      - name: 加载配置
+        run: |
+          source "${GITHUB_WORKSPACE}/${{ env.REPO_NAME }}/common/settings.ini"
+          if [ -f "${GITHUB_WORKSPACE}/${{ env.REPO_NAME }}/${{ env.ARCH_NAME }}/settings.ini" ]; then
+            source "${GITHUB_WORKSPACE}/${{ env.REPO_NAME }}/${{ env.ARCH_NAME }}/settings.ini"
+          fi
+          echo "REPO_URL=${REPO_URL}" >> $GITHUB_ENV
+          echo "REPO_BRANCH=${REPO_BRANCH}" >> $GITHUB_ENV
+          echo "CONFIG_FILE=${CONFIG_FILE}" >> $GITHUB_ENV
+          echo "CUSTOM_SH=${CUSTOM_SH}" >> $GITHUB_ENV
+          echo "COMMON_SH=${COMMON_SH}" >> $GITHUB_ENV
+          echo "UPLOAD_FIRMWARE_FOR_ARTIFACT=${UPLOAD_FIRMWARE_FOR_ARTIFACT}" >> $GITHUB_ENV
+          echo "UPLOAD_EFI_FIRMWARE_FOR_ARTIFACT=${UPLOAD_EFI_FIRMWARE_FOR_ARTIFACT}" >> $GITHUB_ENV
+          echo "UPLOAD_FIRMWARE_FOR_RELEASE=${UPLOAD_FIRMWARE_FOR_RELEASE}" >> $GITHUB_ENV
+
+      - name: 加载环境
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt -yqq update
+          sudo -E apt -yqq full-upgrade
+          sudo -E apt -yqq autoremove --purge
+          sudo -E apt -yqq autoclean
+          sudo -E apt -yqq clean
+          sudo -E apt -yqq install dos2unix libfuse-dev ccache rename
+          sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo -E systemctl daemon-reload
+          sudo -E timedatectl set-timezone "Asia/Shanghai"
+          #git clone --depth=1 https://github.com/openwrt-dev/po2lmo
+          #(cd po2lmo && sudo make && sudo make install)
+          df -h
+
+      - name: 克隆代码
+        run: |
+          sudo mkdir -p /mnt/build_wrt
+          sudo chown $USER:$USER /mnt/build_wrt
+          sudo ln -s /mnt/build_wrt $GITHUB_WORKSPACE/OpenWrt
+          
+          git clone --depth 1 $REPO_URL -b $REPO_BRANCH OpenWrt
+          rsync -a ${{ env.REPO_NAME }}/{common,${{ env.ARCH_NAME }}}/files/ OpenWrt/ 2>/dev/null || :
+          cp -rf ${{ env.REPO_NAME }} OpenWrt/
+          cd OpenWrt && echo "WRT_HASH=$(git log -1 --pretty=format:'%h')" >> $GITHUB_ENV
+
+          # GitHub Action 移除国内下载源
+          PROJECT_MIRRORS_FILE="./scripts/projectsmirrors.json"
+          if [ -f "$PROJECT_MIRRORS_FILE" ]; then
+            sed -i '/.cn\//d; /tencent/d; /aliyun/d' "$PROJECT_MIRRORS_FILE"
+          fi
+
+      - name: 配置缓存
+        id: ccache
+        uses: actions/cache@main
+        with:
+          key: ${{ env.REPO_NAME }}-${{ env.ARCH_NAME }}-${{env.WRT_HASH}}
+          restore-keys: ${{ env.REPO_NAME }}-${{ env.ARCH_NAME }}
+          path: |
+            ./OpenWrt/.ccache
+            ./OpenWrt/staging_dir/host*
+            ./OpenWrt/staging_dir/tool*
+
+      - name: 更新缓存
+        run: |
+          if [ -d "./OpenWrt/staging_dir" ]; then
+            find "./OpenWrt/staging_dir" -type d -name "stamp" -not -path "*target*" | while read -r DIR; do
+              find "$DIR" -type f -exec touch {} +
+            done
+            mkdir -p ./OpenWrt/tmp && echo "1" > ./OpenWrt/tmp/.build
+            echo "跳过toolchain！"
+          else
+            echo "缓存丢失！"
+          fi
+
+          if ${{steps.ccache.outputs.cache-hit != 'true'}}; then
+            CACHE_LIST=$(gh cache list --key "${{ env.REPO_NAME }}-${{ env.ARCH_NAME }}-${{env.WRT_HASH}}" | cut -f 1)
+            for CACHE_KEY in $CACHE_LIST; do
+              gh cache delete $CACHE_KEY
+            done
+            echo "缓存清理完成！"
+          fi
+
+      - name: 更新feeds
+        run: |
+          cd OpenWrt
+          sed -i "/src-git vi /d; \$a src-git vi https://github.com/fuckactions/OpenWrt-packages;lede" feeds.conf.default
+          ./scripts/feeds update -a
+          chmod +x ${{ env.REPO_NAME }}/common/feeds-vi.sh
+          sudo "${{ env.REPO_NAME }}/common/feeds-vi.sh"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 应用配置
+        run: |
+          cd OpenWrt
+          if [ -f "${{ env.REPO_NAME }}/common/$COMMON_SH" ]; then
+            chmod +x ${{ env.REPO_NAME }}/common/$COMMON_SH
+            /bin/bash "${{ env.REPO_NAME }}/common/$COMMON_SH"
+          fi
+          if [ -f "${{ env.REPO_NAME }}/${{ env.ARCH_NAME }}/$CUSTOM_SH" ]; then
+            chmod +x ${{ env.REPO_NAME }}/${{ env.ARCH_NAME }}/$CUSTOM_SH
+            /bin/bash "${{ env.REPO_NAME }}/${{ env.ARCH_NAME }}/$CUSTOM_SH"
+          fi
+          mv ${{ env.REPO_NAME }}/common/$CONFIG_FILE .config
+          if [ -f "${{ env.REPO_NAME }}/${{ env.ARCH_NAME }}/$CONFIG_FILE" ]; then
+            echo >> .config
+            cat ${{ env.REPO_NAME }}/${{ env.ARCH_NAME }}/$CONFIG_FILE >> .config
+          fi
+
+      - name: 应用补丁
+        run: |
+          cd OpenWrt
+          find "${{ env.REPO_NAME }}/{common,${{ env.ARCH_NAME }}}/patches" -name "*.patch" 2>/dev/null | xargs -I % sh -c 'echo "应用补丁: %" && patch -p1 --no-backup-if-mismatch < % || exit 255'
+
+      - name: 下载依赖
+        timeout-minutes: 10
+        run: |
+          cd OpenWrt
+          make defconfig -j$(nproc) && make clean -j$(nproc)
+          df -hT | grep -v 'tmpfs\|boot'
+
+      - name: 编译固件
+        id: compile
+        timeout-minutes: 300
+        continue-on-error: true
+        run: |
+          set -eo pipefail
+          cd OpenWrt
+          ERROR_LOG="${{ matrix.target }}_make_error.log"
+          FULL_LOG="${{ matrix.target }}_full.log"
+
+          echo "::group::🌀 多线程编译 ${{ matrix.target }}"
+          echo "线程数: $(($(nproc)+1))"
+          if { make -j$(($(nproc)+1)) V=s 2>&1 | tee "$FULL_LOG"; } | grep -E -A 1 'error:|ERROR:|Error 1|cannot|Cannot|Collected errors:|check_data_file_clashes|^\* ' > "$ERROR_LOG"; then
+            echo "✅ 多线程编译成功！"
+            rm -f "$FULL_LOG" "$ERROR_LOG" 2>/dev/null
+            echo "::endgroup::"
+          else
+            echo "❌ 多线程编译失败！"
+            echo "::endgroup::"
+            echo "::group::📜 错误摘要"
+            echo "以下是最后100行错误日志（完整日志见Artifacts）："
+            echo "::error::❌ %0A$(tail -n 100 "$ERROR_LOG" | sed 's/^/   /' | sed ':a;N;$!ba;s/\n/%0A/g')"
+            echo "::endgroup::"
+            echo "::warning::⚠️ 尝试单线程编译..."
+
+            echo "::group::🐌 单线程编译 ${{ matrix.target }}"
+            if { make -j1 V=s 2>&1 | tee "$FULL_LOG"; } | grep -E -A 1 'error:|ERROR:|Error 1|cannot|Cannot|Collected errors:|check_data_file_clashes|^\* ' > "$ERROR_LOG"; then
+              echo "✅ 单线程编译成功！"
+              rm -f "$FULL_LOG" "$ERROR_LOG" 2>/dev/null
+              echo "::notice::降级编译成功！"
+              echo "::endgroup::"
+            else
+              echo "❌ 单线程编译失败！"
+              echo "::endgroup::"
+              echo "::group::📜 错误摘要"
+              echo "以下是最后100行错误日志："
+              echo "::error::❌ %0A$(tail -n 100 "$ERROR_LOG" | sed 's/^/   /' | sed ':a;N;$!ba;s/\n/%0A/g')"
+              echo "::endgroup::"
+              echo "::error::❌ 彻底编译失败！请检查完整日志"
+            fi
+          fi
+
+          if [ ! -e "$FULL_LOG" ]; then
+            echo "::group::💾 磁盘空间使用情况"
+            df -hT | grep -v 'tmpfs\|boot'
+            echo "::endgroup::"
+            echo "::group::📦 生成固件列表"
+            ls -h bin/targets/*/* || true
+            echo "::endgroup::"
+          else
+            echo "LOG=true" >> $GITHUB_ENV  # 标记日志存在
+          fi
+
+      - name: 组织文件
+        continue-on-error: true
+        id: organize
+        run: |
+          mkdir -p firmware
+          if [ "$LOG" = "true" ]; then
+            find OpenWrt/ -maxdepth 1 \( -type f -name "*_full.log" -o -name "*_error.log" \) -exec cp -f {} ./firmware/ \; 2>/dev/null || true
+            ls firmware
+          else
+            find OpenWrt/bin/targets/ -path "*/packages/*" -o -path "*/packages" -prune -o -type f ! -name "*buildinfo" ! -name "*json" ! -name "*txt" ! -name "*manifest" -exec cp -f {} ./firmware/ \; 2>/dev/null  
+            cp OpenWrt/.config  ./firmware/${{matrix.target}}.config  
+            cp OpenWrt/${{ env.REPO_NAME }}/release ./firmware    
+            cd firmware && ls
+            [ "$REPO_NAME" = "lede" ] && rename "s/openwrt/$REPO_NAME/" openwrt-*
+            for file in *; do tar -czf "$file.tar.gz" "$file" && [ -f "$file" ] && rm -f "$file"; done
+            tar -xzf sha256sums.tar.gz && tar -xzf release.tar.gz && tar -xzf ${{matrix.target}}.config.tar.gz && rm -f {sha256sums.tar.gz,release.tar.gz,${{matrix.target}}.config.tar.gz}  
+            sed -i '/## 固件说明/a 1. 固件采用的分支为${{ env.REPO_NAME }}-${{ env.REPO_BRANCH }}!' release
+            mv sha256sums ${{ matrix.target }}_sha256sums
+            echo "FIRMWARE_STATUS=true" >> $GITHUB_ENV
+            compgen -G "*efi*" > /dev/null && echo "EFI=true" >> $GITHUB_ENV
+            compgen -G "*generic*" > /dev/null && echo "COMBINED=true" >> $GITHUB_ENV
+            cd .. && cd OpenWrt && make clean -j$(nproc)
+          fi
+
+      - name: 发布固件
+        uses: softprops/action-gh-release@master
+        id: uprelease
+        continue-on-error: true
+        if: ${{ env.UPLOAD_FIRMWARE_FOR_RELEASE == 'true' && env.FIRMWARE_STATUS == 'true' }}
+        with:
+          files: firmware/*
+          name: ${{ env.date }}-${{ matrix.target }}
+          tag_name: ${{ env.date }}-${{ matrix.target }}
+          body_path: firmware/release
+
+      - name: 上传通用固件
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        if: ${{ (env.UPLOAD_FIRMWARE_FOR_ARTIFACT == 'true' && env.COMBINED == 'true') || env.LOG == 'true' }}
+        with:
+          name: ${{ env.LOG == 'true' && format('{0}_full_error', matrix.target) || format('{0}-{1}', env.date, matrix.target) }}
+          path: |
+            firmware/*generic*
+            firmware/*_full.log
+            !firmware/*ext4*
+            !firmware/*efi*
+            !firmware/*kernel*
+            !firmware/*rootfs*
+
+      - name: 上传EFI固件
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        if: ${{ (env.UPLOAD_EFI_FIRMWARE_FOR_ARTIFACT == 'true' && env.EFI == 'true') }}
+        with:
+          name: ${{ env.LOG == 'true' && format('{0}_full_error', matrix.target) || format('{0}-{1}_EFI', env.date, matrix.target) }}
+          path: |
+            firmware/*efi*
+            !firmware/*ext4*
+
+      - name: 消息通知
+        if: always()
+        run: |
+          if [ "${{ env.LOG }}" = "true" ]; then
+            LOG_FILE="firmware/${{ matrix.target }}_make_error.log"
+            if [ -f "$LOG_FILE" ]; then
+              WERROR_LOG=$(tail -n 10 "$LOG_FILE" | sed 's/"/\\\"/g; s/\*/\>/g; s/$/\<br><br>/')
+              TERROR_LOG=$(tail -n 10 "$LOG_FILE" | sed 's/$/\\n/')
+            else
+              ERROR_LOG="未找到日志文件"
+            fi
+            MSG_TITLE="❌ 固件 ${{ matrix.target }} 编译失败"  
+            WMSG_CONTENT="失败信息摘要：\n📅编译日期：${{ env.date }}\n<details><summary>错误日志：点击展开</summary><pre>${WERROR_LOG}</pre></details>\n📁查看完整日志请下载Artifacts"
+            TMSG_CONTENT="\n------\n📅编译日期：${{ env.date }}\n📜错误日志：\n<pre>${TERROR_LOG}</pre>\n📁查看完整日志请下载Artifacts"
+          else  
+            MSG_TITLE="✅ 固件 ${{ matrix.target }} 编译完成"  
+            RELEASE_URL="${{ steps.uprelease.outputs.url }}"
+            WMSG_CONTENT="构建信息摘要：\n📅编译日期：${{ env.date }}\n🎯生成目标：${{ matrix.target }}\n⬇️下载地址：<a href=\\\"${RELEASE_URL}\\\">${{ matrix.target }}-${{ env.REPO_BRANCH }}</a>"
+            TMSG_CONTENT="\n------\n📅编译日期：${{ env.date }}\n🎯生成目标：${{ matrix.target }}\n⬇️下载地址：<a href=\"${RELEASE_URL}\">${{ matrix.target }}-${{ env.REPO_BRANCH }}</a>"
+          fi  
+          
+          # PushPlus通知
+          if [ -n "${{ secrets.PUSHPLUS_TOKEN }}" ]; then
+            curl -X POST \
+              -H "Content-Type: application/json" \
+              -d "{ \
+                \"token\": \"${{ secrets.PUSHPLUS_TOKEN }}\", \
+                \"title\": \"$MSG_TITLE\", \
+                \"content\": \"$(echo -e $WMSG_CONTENT)\" \
+              }" \
+              http://www.pushplus.plus/send  
+          fi
+
+          # Telegram通知
+          if [ -n "${{ secrets.TELEGRAM_TOKEN }}" ]; then
+            TMSG_HTML=$(echo -e "$TMSG_CONTENT" | sed 's/\\n/%0A/g')
+            curl -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              --data-urlencode "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "text=<b>${MSG_TITLE}</b>${TMSG_HTML}"
+          fi
+
+      - name: 清理空间
+        uses: ophub/delete-releases-workflows@main
+        with:
+          gh_token: ${{secrets.REPO_TOKEN}}
+          workflows_keep_day: 1     # 保留1天的工作流记录
+          releases_keep_latest: 2   # 保留2个最新Release
+          delete_releases: true     # 删除旧Release
+          delete_tags: true         # 删除关联标签
+          delete_workflows: true    # 删除旧工作流
